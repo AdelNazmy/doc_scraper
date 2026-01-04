@@ -1,0 +1,21 @@
+import asyncio
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
+from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+
+async def main():
+    config = CrawlerRunConfig(
+        markdown_generator=DefaultMarkdownGenerator()
+    )
+    async with AsyncWebCrawler() as crawler:
+        result = await crawler.arun("https://developers.llamaindex.ai/python/llamaagents/overview/", config=config)
+
+        if result.success:
+            #print("Raw Markdown Output:\n")
+            #print(result.markdown)  # The unfiltered markdown from the page
+            with open("scrapped.md","w") as f:
+                f.write(result.markdown)
+        else:
+            print("Crawl failed:", result.error_message)
+
+if __name__ == "__main__":
+    asyncio.run(main())
