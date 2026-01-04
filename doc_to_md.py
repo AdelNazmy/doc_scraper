@@ -25,10 +25,10 @@ def folder_name_from_url(url: str) -> str:
     p = urlparse(url)
     domain = p.netloc.lower()
     path = p.path.strip("/")
-    
+
     # Clean domain name (remove www, ports)
     domain = domain.replace("www.", "").replace(":", "_")
-    
+
     # Create folder name components
     parts = [domain]
     if path:
@@ -37,13 +37,14 @@ def folder_name_from_url(url: str) -> str:
         if path_parts:
             safe_path = "_".join(re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "section" for s in path_parts)
             parts.append(safe_path)
-    
+
     folder_name = "_".join(parts)
     # Ensure folder name is filesystem safe
     folder_name = re.sub(r"[^A-Za-z0-9._-]+", "-", folder_name).strip("-")
     return folder_name or "doc_dump"
 
 
+# Global variables
 TEST_MODE = "--test" in sys.argv
 if TEST_MODE:
     sys.argv.remove("--test")
@@ -56,6 +57,30 @@ if "--no-unique" in sys.argv:
     UNIQUE_ON = False
     sys.argv.remove("--no-unique")
 
+# Parse depth argument
+DEPTH_ARG = None
+if "--depth" in sys.argv:
+    try:
+        idx = sys.argv.index("--depth")
+        if idx + 1 < len(sys.argv):
+            DEPTH_ARG = int(sys.argv[idx + 1])
+            sys.argv.remove("--depth")
+            sys.argv.remove(str(DEPTH_ARG))
+    except (ValueError, IndexError):
+        pass
+if DEPTH_ARG is None:
+    DEPTH_ARG = float('inf')  # Default to unlimited depth
+
+if "--infinite" in sys.argv:
+    DEPTH_ARG = float('inf')
+    sys.argv.remove("--infinite")
+
+# Remove any remaining --depth or --infinite arguments
+while "--depth" in sys.argv:
+    sys.argv.remove("--depth")
+while "--infinite" in sys.argv:
+    sys.argv.remove("--infinite")
+
 try:
     if len(sys.argv) > 1:
         START_URL = sys.argv[1].strip()
@@ -65,14 +90,24 @@ except (EOFError, IndexError):
     START_URL = ""
 
 if not START_URL:
-    print("Usage: python doc_to_md.py [--test] <URL>", file=sys.stderr)
-    print("Example: python doc_to_md.py --test https://docs.example.com/page.html", file=sys.stderr)
+    print("Usage: python doc_to_md.py [--test] [--unique|--no-unique] [--depth N] <URL>", file=sys.stderr)
+    print("Example: python doc_to_md.py --test --depth 2 https://docs.example.com/page.html", file=sys.stderr)
     sys.exit(2)
 
 OUTPUT_DIR = folder_name_from_url(START_URL)
 CONCURRENCY = 16
 PAGE_TIMEOUT_MS = 30000
 MIN_DUP_WORDS = 100
+
+def main_execution():
+    if __name__ == "__main__":
+        try:
+            dumper = DocDumper(START_URL, OUTPUT_DIR, dedup=UNIQUE_ON, max_depth=DEPTH_ARG)
+            asyncio.run(dumper.run())
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            sys.exit(130)
+
 
 USE_COOKIE_SELECTORS = False
 USE_TARGET_SELECTORS = False
@@ -182,7 +217,7 @@ def extract_canonical(html_str: str, base_url: str, host: str, base_prefix: str)
 
 
 class DocDumper:
-    def __init__(self, start_url: str, out_dir: str, dedup: bool = True):
+    def __init__(self, start_url: str, out_dir: str, dedup: bool = True, max_depth: float = float('inf')):
         self.start_url = normalize_url(start_url)
         self.root, self.host, self.base = base_prefix(self.start_url)
         self.out = Path(out_dir)
@@ -195,9 +230,10 @@ class DocDumper:
         self.saved_urls: set[str] = set()
         self.content_hashes: set[str] = set()
         self.url_to_file: dict[str, str] = {}
-        self.crawl_queue: list[str] = []
-        self.enqueued_urls: set[str] = set()
+        self.crawl_queue: list[tuple[str, int]] = []  # (url, depth)
+        self.enqueued_urls: dict[str, int] = {}  # url -> depth
 
+        self.max_depth = max_depth
         self.dedup_enabled = dedup
         self._chunk_db: dict[str, int] = {}
         self._shutdown_requested = False
@@ -265,6 +301,10 @@ class DocDumper:
                 print(f"[RESUME][WARN] Progress file has different host, starting fresh")
                 return
             
+            # Load max_depth from metadata if available
+            if 'max_depth' in metadata:
+                self.max_depth = metadata['max_depth']
+            
             state = progress.get('state', {})
             
             seen_urls = state.get('seen_urls', [])
@@ -303,13 +343,25 @@ class DocDumper:
             
             queue = state.get('queue', [])
             if isinstance(queue, list):
-                self.crawl_queue = queue
+                # Convert old format to new format with depth tracking
+                if queue and isinstance(queue[0], str):
+                    # Old format: list of strings
+                    self.crawl_queue = [(url, 0) for url in queue]
+                else:
+                    # New format: list of (url, depth) tuples
+                    self.crawl_queue = queue
             else:
                 print(f"[RESUME][WARN] Invalid queue format, ignoring")
                 
             enqueued = state.get('enqueued', [])
             if isinstance(enqueued, list):
-                self.enqueued_urls = set(enqueued)
+                # Convert old format to new format with depth tracking
+                if enqueued and isinstance(enqueued[0], str):
+                    # Old format: list of strings
+                    self.enqueued_urls = {url: 0 for url in enqueued}
+                else:
+                    # New format: list of (url, depth) tuples
+                    self.enqueued_urls = {item[0]: item[1] for item in enqueued}
             else:
                 print(f"[RESUME][WARN] Invalid enqueued format, ignoring")
             
@@ -334,7 +386,8 @@ class DocDumper:
                 "metadata": {
                     "start_url": self.start_url,
                     "host": self.host,
-                    "dedup_enabled": self.dedup_enabled
+                    "dedup_enabled": self.dedup_enabled,
+                    "max_depth": self.max_depth
                 },
                 "state": {
                     "seen_urls": list(self.seen_urls),
@@ -343,7 +396,7 @@ class DocDumper:
                     "url_to_file": self.url_to_file,
                     "chunk_db": self._chunk_db,
                     "queue": self.crawl_queue,
-                    "enqueued": list(self.enqueued_urls)
+                    "enqueued": list(self.enqueued_urls.items())  # Convert dict to list of tuples
                 }
             }
             
@@ -392,7 +445,8 @@ class DocDumper:
                 seen.add(u)
                 uniq.append(u)
         print(f"[SEED] in-scope = {len(uniq)}")
-        return uniq
+        # Return URLs with depth 0
+        return [(url, 0) for url in uniq]
 
     def canonicalize(self, url: str, html_str: str) -> str:
         can = extract_canonical(html_str, url, self.host, self.base)
@@ -403,19 +457,19 @@ class DocDumper:
     async def crawl(self):
         if self.crawl_queue:
             print(f"[RESUME] Continuing with {len(self.crawl_queue)} URLs in queue")
-            queue = [url for url in self.crawl_queue if url not in self.seen_urls]
-            enq = set(self.enqueued_urls)
+            queue = [(url, depth) for url, depth in self.crawl_queue if url not in self.seen_urls]
+            enq = dict(self.enqueued_urls)
             print(f"[RESUME] Filtered queue: {len(queue)} URLs remaining to process")
         else:
             if TEST_MODE:
                 print("[TEST] Test mode: crawling single URL only")
-                seeds = [self.start_url]
+                seeds = [(self.start_url, 0)]
             else:
                 seeds = await self.seed_urls()
                 if not seeds:
-                    seeds = [self.start_url]
+                    seeds = [(self.start_url, 0)]
             queue = list(seeds)
-            enq = set(queue)
+            enq = {url: depth for url, depth in queue}
 
         dispatcher = MemoryAdaptiveDispatcher(
             memory_threshold_percent=80.0,
@@ -430,14 +484,21 @@ class DocDumper:
 
             while queue and len(self.seen_urls) < hard_cap and not self._shutdown_requested:
                 batch = []
+                batch_depths = []
                 while queue and len(batch) < batch_size:
-                    u = queue.pop(0)
+                    u, depth = queue.pop(0)
                     if not has_binary_ext(u):
-                        batch.append(u)
+                        # Only add to batch if we're within depth limits
+                        if depth <= self.max_depth:
+                            batch.append(u)
+                            batch_depths.append(depth)
+                        else:
+                            # If we exceed max depth, don't process this URL
+                            continue
                 if not batch:
                     break
 
-                print(f"[BATCH] Processing {len(batch)} URLs concurrently...")
+                print(f"[BATCH] Processing {len(batch)} URLs concurrently (max depth: {self.max_depth})...")
                 
                 batch_seen_start = len(self.seen_urls)
                 
@@ -448,7 +509,14 @@ class DocDumper:
                     dispatcher=dispatcher
                 )
                 new_urls_found = False
+                # Process results with async iteration
+                results_processed = 0
                 async for res in results:
+                    if results_processed >= len(batch):
+                        break
+                    original_url = batch[results_processed]
+                    current_depth = batch_depths[results_processed]
+                    results_processed += 1
                     raw = normalize_url(getattr(res, "url", ""))
                     self.seen_urls.add(raw)
 
@@ -460,27 +528,30 @@ class DocDumper:
 
                     await self.save_if_unique(cur, res)
 
-                    lib_set: set[str] = set()
-                    links_field = getattr(res, "links", None) or {}
-                    for item in links_field.get("internal", []):
-                        href = item.get("href") if isinstance(item, dict) else None
-                        if not href:
-                            continue
-                        n = normalize_url(urljoin(cur, href))
-                        if in_scope(n, self.host, self.base) and not has_binary_ext(n):
-                            lib_set.add(n)
+                    # Only extract links if we haven't reached max depth yet
+                    next_depth = current_depth + 1
+                    if next_depth <= self.max_depth:
+                        lib_set: set[str] = set()
+                        links_field = getattr(res, "links", None) or {}
+                        for item in links_field.get("internal", []):
+                            href = item.get("href") if isinstance(item, dict) else None
+                            if not href:
+                                continue
+                            n = normalize_url(urljoin(cur, href))
+                            if in_scope(n, self.host, self.base) and not has_binary_ext(n):
+                                lib_set.add(n)
 
-                    dom_set = extract_links_html(html_str, cur, self.host, self.base)
+                        dom_set = extract_links_html(html_str, cur, self.host, self.base)
 
-                    if not TEST_MODE:
-                        for v in (lib_set | dom_set):
-                            if v not in enq:
-                                enq.add(v)
-                                queue.append(v)
-                                new_urls_found = True
+                        if not TEST_MODE:
+                            for v in (lib_set | dom_set):
+                                if v not in enq or enq[v] > next_depth:
+                                    enq[v] = next_depth
+                                    queue.append((v, next_depth))
+                                    new_urls_found = True
 
                 batch_processed = len(self.seen_urls) - batch_seen_start
-                unique_queue_size = len(set(queue))
+                unique_queue_size = len(queue)
                 print(f"[BATCH] Completed. Processed: {batch_processed}, Queue size: {unique_queue_size}, Total seen: {len(self.seen_urls)}")
                 
                 self.crawl_queue = queue
@@ -591,9 +662,4 @@ class DocDumper:
 
 
 if __name__ == "__main__":
-    try:
-        dumper = DocDumper(START_URL, OUTPUT_DIR, dedup=UNIQUE_ON)
-        asyncio.run(dumper.run())
-    except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        sys.exit(130)
+    main_execution()
